@@ -87,11 +87,12 @@ summary::-webkit-details-marker{display:none}
     </div>
     <button class="go" id="scan">Scan now</button>
     <label class="chk"><input type="checkbox" id="only"> Signals only</label>
+    <label class="chk"><input type="checkbox" id="byBeta"> Highest beta first</label>
   </div>
   <p class="status" id="status" aria-live="polite"></p>
   <div class="tally" id="tally"></div>
   <div class="list" id="list"><div class="empty">Tap Scan now to check every coin on your list.</div></div>
-  <p class="note">Buy = 4 or more of 6 signals and not already extended. Watch = 3 signals. Extended = up more than 12% in 24h or RSI above 75, so the move has probably started without you. Reference stop and target are 1.5x and 3x the average candle range from the current price. Signals raise the odds; they do not predict. Check Robinhood for availability before you buy, and edit coins.json to match its list.</p>
+  <p class="note">Buy = 4 or more of 6 signals and not already extended. Watch = 3 signals. Extended = up more than 12% in 24h or RSI above 75, so the move has probably started without you. Reference stop and target are 1.5x and 3x the average candle range from the current price. Beta shows how much a coin moved per 1% move in BTC (or ETH) over its last 300 candles, so 1.5 means it moved about 1.5% when BTC moved 1%. It changes over time. Signals raise the odds; they do not predict. Check Robinhood for availability before you buy, and edit coins.json to match its list.</p>
 </main>
 <script>
 // ==== CORE (same logic as scanner.py) ====
@@ -127,6 +128,19 @@ function analyze(bars,gran){
   const status=(extended&&score>=WATCH_SCORE)?"extended":score>=BUY_SCORE&&!extended?"buy":score>=WATCH_SCORE&&!extended?"watch":"none";
   return{price,chg24,rsi:R(1),volRatio,score,signals,status,stop:price-1.5*a,target:price+3*a};
 }
+function betaVs(bars,ref,gran){
+  const m=new Map(ref.map(b=>[b.t,b.c])),x=[],y=[];
+  for(let i=1;i<bars.length;i++){
+    if(bars[i].t-bars[i-1].t!==gran)continue;
+    const a=m.get(bars[i].t),b=m.get(bars[i-1].t);
+    if(a&&b){x.push(a/b-1);y.push(bars[i].c/bars[i-1].c-1)}
+  }
+  if(x.length<100)return null;
+  const mean=a=>a.reduce((s,v)=>s+v,0)/a.length,mx=mean(x),my=mean(y);
+  let cov=0,vx=0,vy=0;
+  for(let i=0;i<x.length;i++){cov+=(x[i]-mx)*(y[i]-my);vx+=(x[i]-mx)**2;vy+=(y[i]-my)**2}
+  return vx>0&&vy>0?{beta:cov/vx,corr:cov/Math.sqrt(vx*vy)}:null;
+}
 // ==== END CORE ====
 
 const API="https://api.exchange.coinbase.com";
@@ -158,6 +172,12 @@ const LABELS={volume:["Volume","Last 3 candles trade at 1.8x normal volume, and 
   breakout:["Breakout","Price closed above the highest high of the last 24 candles."]};
 const STATUS={buy:"Buy",watch:"Watch",extended:"Extended",none:"No signal"};
 
+function sortResults(){
+  const rank={buy:2,watch:1},bb=x=>x.btc?x.btc.beta:-99;
+  if($("byBeta").checked)results.sort((a,b)=>bb(b)-bb(a));
+  else results.sort((a,b)=>(rank[b.status]||0)-(rank[a.status]||0)||b.score-a.score);
+}
+const fb=b=>b?`${b.beta.toFixed(2)} <span class="px">(corr ${b.corr.toFixed(2)})</span>`:"n/a";
 function render(){
   const only=$("only").checked;
   const rows=results.filter(x=>!only||x.status!=="none");
@@ -176,6 +196,8 @@ function render(){
       <div class="facts"><div><span>Price</span><span>$${fp(x.price)}</span></div>
       <div><span>RSI</span><span>${x.rsi.toFixed(0)}</span></div>
       <div><span>Volume vs normal</span><span>${x.volRatio.toFixed(1)}x</span></div>
+      <div><span>Beta to BTC</span><span>${fb(x.btc)}</span></div>
+      <div><span>Beta to ETH</span><span>${fb(x.eth)}</span></div>
       <div><span>Reference stop</span><span>$${fp(x.stop)}</span></div>
       <div><span>Reference target</span><span>$${fp(x.target)}</span></div></div></div></details>`}).join("");
 }
@@ -184,17 +206,17 @@ async function scan(){
   if(busy)return;busy=true;$("scan").disabled=true;
   const coins=(await loadCoins()).map(s=>String(s).toUpperCase().replace(/[^A-Z0-9]/g,""));
   const out=[],failed=[];let done=0,i=0;
+  $("status").textContent="Loading BTC and ETH";
+  const refBtc=await fetchBars("BTC"),refEth=await fetchBars("ETH");
   async function worker(){
     while(i<coins.length){
-      const sym=coins[i++];const res=analyze(await fetchBars(sym),gran);
-      if(res){res.sym=sym;out.push(res)}else failed.push(sym);
+      const sym=coins[i++];const bars=await fetchBars(sym);const res=analyze(bars,gran);
+      if(res){res.sym=sym;res.btc=refBtc?betaVs(bars,refBtc,gran):null;res.eth=refEth?betaVs(bars,refEth,gran):null;out.push(res)}else failed.push(sym);
       $("status").textContent=`Scanning ${++done} of ${coins.length}`;await sleep(120);
     }
   }
   await Promise.all([worker(),worker(),worker(),worker()]);
-  const rank={buy:2,watch:1};
-  out.sort((a,b)=>(rank[b.status]||0)-(rank[a.status]||0)||b.score-a.score);
-  results=out;
+  results=out;sortResults();
   const t=new Date().toLocaleTimeString([], {hour:"numeric",minute:"2-digit"});
   $("status").textContent=out.length?`Updated ${t}. Rescans every 5 minutes while this page is open.${failed.length?` No data for ${failed.join(", ")}.`:""}`
     :"Couldn't load prices. Check your connection and tap Scan now.";
@@ -202,7 +224,7 @@ async function scan(){
 }
 function setTf(g){gran=g;$("tf1h").setAttribute("aria-pressed",g===3600);$("tf15").setAttribute("aria-pressed",g===900);scan()}
 $("tf1h").onclick=()=>setTf(3600);$("tf15").onclick=()=>setTf(900);
-$("scan").onclick=scan;$("only").onchange=render;
+$("scan").onclick=scan;$("only").onchange=render;$("byBeta").onchange=()=>{sortResults();render()};
 setInterval(()=>{if(!document.hidden)scan()},300000);
 scan();
 </script>

@@ -142,6 +142,30 @@ def analyze(bars, gran=GRAN):
             "stop": price - 1.5 * a, "target": price + 3 * a}
 
 
+def beta_vs(bars, ref, gran=GRAN):
+    """Beta and correlation of bars' returns vs ref's returns (matched by timestamp)."""
+    rc = {b[0]: b[4] for b in ref}
+    x, y = [], []
+    for i in range(1, len(bars)):
+        if bars[i][0] - bars[i - 1][0] != gran:
+            continue
+        a, b = rc.get(bars[i][0]), rc.get(bars[i - 1][0])
+        if a and b:
+            x.append(a / b - 1); y.append(bars[i][4] / bars[i - 1][4] - 1)
+    if len(x) < 100:
+        return None
+    mx, my = sum(x) / len(x), sum(y) / len(y)
+    cov = sum((a - mx) * (b - my) for a, b in zip(x, y))
+    vx = sum((a - mx) ** 2 for a in x); vy = sum((b - my) ** 2 for b in y)
+    if vx <= 0 or vy <= 0:
+        return None
+    return cov / vx, cov / (vx * vy) ** 0.5
+
+
+def fmt_beta(b):
+    return f"{b[0]:.2f}" if b else "n/a"
+
+
 def fmt_price(p):
     return f"{p:,.2f}" if p >= 1 else f"{p:.6f}".rstrip("0")
 
@@ -167,24 +191,31 @@ def main():
     coins = json.loads((HERE / "coins.json").read_text())
     state = json.loads(STATE.read_text()) if STATE.exists() else {}
     now = time.time(); results = []
+    ref_btc, ref_eth = fetch_bars("BTC"), fetch_bars("ETH")
     for sym in coins:
-        res = analyze(fetch_bars(sym))
+        bars = fetch_bars(sym)
+        res = analyze(bars)
         time.sleep(0.2)
         if res:
-            res["sym"] = sym; results.append(res)
+            res["sym"] = sym
+            res["btc"] = beta_vs(bars, ref_btc) if ref_btc else None
+            res["eth"] = beta_vs(bars, ref_eth) if ref_eth else None
+            results.append(res)
         else:
             print(f"{sym}: no data")
     results.sort(key=lambda x: (-{"buy": 2, "watch": 1}.get(x["status"], 0), -x["score"]))
-    print(f"{'COIN':7}{'PRICE':>12}{'24h':>8}{'RSI':>6}{'VOL x':>7}{'SCORE':>6}  STATUS")
+    print(f"{'COIN':7}{'PRICE':>12}{'24h':>8}{'RSI':>6}{'VOL x':>7}{'SCORE':>6}{'B-BTC':>7}{'B-ETH':>7}  STATUS")
     for x in results:
         print(f"{x['sym']:7}{fmt_price(x['price']):>12}{x['chg24']*100:>7.1f}%"
-              f"{x['rsi']:>6.0f}{x['volRatio']:>7.1f}{x['score']:>6}  {x['status']}")
+              f"{x['rsi']:>6.0f}{x['volRatio']:>7.1f}{x['score']:>6}"
+              f"{fmt_beta(x['btc']):>7}{fmt_beta(x['eth']):>7}  {x['status']}")
         if x["status"] == "buy" and not dry:
             if now - state.get(x["sym"], 0) >= COOLDOWN_H * 3600:
                 on = ", ".join(k for k, ok in x["signals"].items() if ok)
                 pushover(f"BUY signal: {x['sym']}",
                          f"Price {fmt_price(x['price'])} ({x['chg24']*100:+.1f}% 24h)\n"
                          f"Score {x['score']}/6: {on}\n"
+                         f"Beta to BTC {fmt_beta(x['btc'])}\n"
                          f"Ref. stop {fmt_price(x['stop'])} / target {fmt_price(x['target'])}")
                 state[x["sym"]] = now
     if not dry:
